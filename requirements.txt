@@ -1,0 +1,41 @@
+# Qwen3-ASR CPU runtime - pinned dependency set
+# Target: Windows / Python 3.12 / no CUDA (AMD Ryzen 8745HS + Radeon 780M iGPU)
+#
+# Install with the project virtualenv, never into the global Python:
+#   python.exe -m pip install -r requirements.txt
+#
+# Notes
+#   * PyPI index defaults to the official pypi.org (the setup script passes
+#     --index-url). On networks that cannot reach pypi.org, pass a domestic
+#     mirror to setup_env.ps1 via -Mirror.
+#   * torch must be the CPU build (no NVIDIA GPU). PyPI wheels on Windows
+#     are CPU-only by default - do not install a CUDA index variant.
+#   * `qwen-asr` declares `sox` as a dependency. The package source never
+#     imports sox (verified in the 0.0.6 wheel); audio loading goes through
+#     librosa + soundfile. We therefore install it with --no-deps in
+#     setup_env.ps1 and install the real dependencies from this file.
+#   * flash-attn / vllm are intentionally absent: both require CUDA.
+
+# --- core ASR runtime ---
+transformers==4.57.6
+accelerate==1.12.0
+qwen-omni-utils
+nagisa==0.2.11
+soynlp==0.0.493
+librosa
+soundfile
+
+# --- inference server / dev interfaces ---
+fastapi
+uvicorn[standard]
+python-multipart          # multipart/form-data uploads (required by /v1/audio/transcriptions)
+websockets                # WebSocket streaming interface
+pydantic
+pydantic-settings
+
+# --- model weights download (domestic mirror) ---
+modelscope
+
+# --- convenience ---
+requests
+tqdm

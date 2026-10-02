@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Models / weights (download via download_model.py, too large for git)
+models/
+Qwen3-ASR-0.6B*/
+
+# Cache & temp
+.tmp/
+*.log
+
+# Misc
+.DS_Store
+Thumbs.db
