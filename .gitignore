@@ -11,6 +11,12 @@ Qwen3-ASR-0.6B*/
 # Cache & temp
 .tmp/
 *.log
+.build_tmp/
+
+# Backups & runtime data (not source)
+_backup_*/
+transcripts/
+failed_audio/
 
 # Misc
 .DS_Store

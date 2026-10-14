@@ -3,7 +3,10 @@ Qwen3-ASR inference engine — single-process, CPU-optimized.
 
 Design choices:
   * Model is loaded ONCE at startup; all requests share the same instance.
-  * A threading.Semaphore serialises inference to avoid memory blow on CPU.
+  * Inference is strictly serialised: `Qwen3ASRModel` is one shared instance
+    holding generation state, and `max_inference_batch_size` defaults to 1.
+    A thread lock enforces this even if the semaphore or worker count is
+    widened, because on CPU extra concurrency only delays every request.
   * The qwen_asr package handles audio normalization internally, but we
     still call audio.prepare_audio() for uploaded files to be safe.
 """
@@ -12,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -27,8 +31,16 @@ logger = logging.getLogger("qwen3-asr.engine")
 # Global state
 _model = None
 _aligner = None
+# One inference thread. `Qwen3ASRModel` is a single shared instance with
+# generation state, so inference is serialised by design.
 _executor = ThreadPoolExecutor(max_workers=1)
 _semaphore = asyncio.Semaphore(settings.max_concurrent)
+# Belt and braces for the same reason: even if the semaphore were widened (or
+# the executor given more workers), only one thread may be inside the model at
+# a time. Measured on this CPU: 6 concurrent requests complete strictly one
+# after another, so widening max_concurrent buys nothing - it only hides the
+# real limit from whoever is tuning the server.
+_infer_lock = threading.Lock()
 
 
 async def load_model():
@@ -70,6 +82,13 @@ async def load_model():
     _model = Qwen3ASRModel.from_pretrained(str(MODEL_DIR), **kwargs)
     elapsed = time.time() - t0
     logger.info("Model loaded in %.1f s", elapsed)
+    if settings.max_concurrent > 1:
+        logger.warning(
+            "max_concurrent=%d, but inference is serialised (one model instance); "
+            "effective concurrency is 1. Raise QWEN_ASR_MAX_CONCURRENT only together "
+            "with a thread-safe backend.",
+            settings.max_concurrent,
+        )
 
 
 def transcribe_sync(
@@ -85,12 +104,13 @@ def transcribe_sync(
     # qwen_asr accepts (np.ndarray, sr) tuples directly
     audio_input = (audio, SAMPLE_RATE)
 
-    results = _model.transcribe(
-        audio=audio_input,
-        language=language,
-        context=context,
-        return_time_stamps=return_timestamps,
-    )
+    with _infer_lock:
+        results = _model.transcribe(
+            audio=audio_input,
+            language=language,
+            context=context,
+            return_time_stamps=return_timestamps,
+        )
     return results[0]  # single audio -> single result
 
 
@@ -124,4 +144,8 @@ def get_model_info() -> dict:
         "device": str(getattr(_model, "device", "cpu")),
         "dtype": str(getattr(_model, "dtype", "float32")),
         "forced_aligner": _aligner is not None,
+        # Inference is serialised, so this is the honest answer to "how many
+        # requests actually run at once" - see the lock above.
+        "inference_slots": 1,
+        "max_concurrent_configured": settings.max_concurrent,
     }

@@ -18,6 +18,7 @@ import asyncio
 import io
 import json
 import logging
+import math
 import struct
 import time
 from contextlib import asynccontextmanager
@@ -119,6 +120,37 @@ def _format_timestamps_json(result) -> dict:
     return {"text": result.text, "language": result.language, "segments": segs}
 
 
+# ============================================================ request tracing
+
+def _fmt_db(audio: np.ndarray) -> float:
+    """RMS level in dBFS."""
+    if audio.size == 0:
+        return -120.0
+    rms = float(np.sqrt(np.mean(np.square(audio, dtype=np.float64))))
+    return 20.0 * math.log10(max(rms, 1e-9))
+
+
+def _log_request(audio: np.ndarray, language) -> None:
+    """Print what actually arrived, so client-side level bugs are visible here.
+
+    A model that answers "嗯。" or an empty string is usually reacting to a quiet
+    or malformed chunk rather than failing; these numbers make that obvious
+    instead of leaving it to guesswork on the client.
+    """
+    seconds = audio.size / SAMPLE_RATE
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    logger.info("[REQ] %.2fs  rms=%.1f dBFS  peak=%.1f dBFS  lang=%s",
+                seconds, _fmt_db(audio), 20.0 * math.log10(max(peak, 1e-9)),
+                language or "auto")
+
+
+def _log_result(audio: np.ndarray, language, text: str) -> None:
+    shown = (text or "").replace("\n", " ")
+    logger.info("[RES] %.2fs  rms=%.1f dBFS  %d chars -> %r",
+                audio.size / SAMPLE_RATE, _fmt_db(audio), len(text or ""),
+                shown[:120])
+
+
 # ============================================================ POST /v1/audio/transcriptions
 
 @app.post("/v1/audio/transcriptions")
@@ -148,6 +180,9 @@ async def openai_transcriptions(
     # --- language ---
     lang = language if language else None
 
+    if config.settings.debug_requests:
+        _log_request(audio, lang)
+
     # --- timestamps ---
     want_ts = response_format in ("verbose_json", "srt", "vtt") or \
               (timestamp_granularities and "segment" in timestamp_granularities)
@@ -163,6 +198,9 @@ async def openai_transcriptions(
     except Exception as e:
         logger.exception("transcription failed")
         raise HTTPException(500, f"Inference error: {e}")
+
+    if config.settings.debug_requests:
+        _log_result(audio, lang, result.text)
 
     # --- format response ---
     if response_format == "text":
@@ -426,10 +464,25 @@ async def audio_stream(websocket: WebSocket):
 # ============================================================ main
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Qwen3-ASR server")
+    parser.add_argument("--debug-requests", action="store_true",
+                        help="log the level and result of every transcription request")
+    parser.add_argument("--port", type=int, default=None, help="override the listen port")
+    cli = parser.parse_args()
+    if cli.debug_requests:
+        config.settings.debug_requests = True
+    if cli.port:
+        config.settings.port = cli.port
+
     logging.basicConfig(
         level=getattr(logging, config.settings.log_level, logging.INFO),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    if config.settings.debug_requests:
+        logging.getLogger("qwen3-asr.server").info(
+            "per-request tracing ON: every request logs its level and the returned text")
     uvicorn.run(
         "server:app",
         host=config.settings.host,

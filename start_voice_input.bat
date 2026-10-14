@@ -1,7 +1,9 @@
 @echo off
 setlocal
 set "PY=D:\Anaconda\envs\yolo-asr\python.exe"
-set "BASE=E:\YOLO\qwen3-asr"
+rem %~dp0 = this .bat's own directory, so the launcher works from any CWD
+rem (double-click, Startup folder, or a call from another script).
+set "BASE=%~dp0"
 title Qwen3-ASR Voice Input
 
 rem 1) start ASR server if it is not running
