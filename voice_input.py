@@ -91,11 +91,47 @@ def _cfg(*names, default):
 # ============================================================ helpers
 
 def beep(freq: int, dur: int) -> None:
+    """Legacy synchronous beep — do NOT call from the audio callback or the
+    keyboard hook: winsound.Beep blocks for `dur` ms, and blocking the audio
+    thread for longer than one 20 ms callback window starves the stream and
+    makes the whole tool appear frozen. Use beep_async() everywhere instead."""
     try:
         import winsound
         winsound.Beep(freq, dur)
     except Exception:
         pass
+
+
+# ------------------------------------------------------------ async beeps
+# All "tick" sounds run on one dedicated daemon thread. Requests are coalesced
+# to the latest one, so a burst of segments sounds one short tick instead of a
+# queue of blocking Beeps piling up.
+_beep_q: collections.deque = collections.deque()
+_beep_cv = threading.Condition()
+
+
+def _beep_worker() -> None:
+    while True:
+        with _beep_cv:
+            while not _beep_q:
+                _beep_cv.wait()
+            freq, dur = _beep_q.popleft()
+            _beep_q.clear()          # coalesce: only the newest beep matters
+        try:
+            import winsound
+            winsound.Beep(freq, dur)
+        except Exception:
+            pass
+
+
+threading.Thread(target=_beep_worker, name="beep", daemon=True).start()
+
+
+def beep_async(freq: int, dur: int) -> None:
+    """Queue a beep; returns immediately. Safe from any thread."""
+    with _beep_cv:
+        _beep_q.append((freq, dur))
+        _beep_cv.notify()
 
 
 def dbfs(block: np.ndarray) -> float:
@@ -116,7 +152,7 @@ def _finite(value, fallback: float) -> float:
 
 
 def log(tag: str, message: str) -> None:
-    print(f"{tag} {message}", flush=True)
+    print(f"[{time.strftime('%H:%M:%S')}] {tag} {message}", flush=True)
 
 
 def set_console_title(text: str) -> None:
@@ -239,8 +275,15 @@ class SilenceSegmenter:
     """
 
     RELEASE = 0.08        # display decay per 20 ms block (~250 ms time constant)
-    SILENCE_ABOVE_FLOOR = 10.0
-    SPEECH_ABOVE_FLOOR = 18.0
+    # Gates are derived from the noise floor as floor + N dB. The speech gate
+    # used to sit at floor+18 dB; on this machine's mic array (and laptops
+    # generally) ordinary speech captured 40-60 cm away lands only ~8-12 dB
+    # above the room floor, so it was rejected as "no speech" and every quiet
+    # utterance silently vanished. 12 dB still ignores room tone (which stays
+    # within a few dB of the floor) while letting normal-distance speech
+    # through; min_speech still filters blips.
+    SILENCE_ABOVE_FLOOR = 8.0
+    SPEECH_ABOVE_FLOOR = 12.0
 
     def __init__(self, *, silence_db: float, speech_db: float, silence_hold: float,
                  min_speech: float, preroll: float, max_segment: float,
@@ -814,12 +857,14 @@ class ASRClient:
         if language:
             data["language"] = language
         with self._lock:                    # requests.Session is not thread-safe
+            t0 = time.time()
             r = self.session.post(
                 self.transcribe_url,
                 files={"file": ("speech.wav", buf, "audio/wav")},
                 data=data,
                 timeout=self.timeout,
             )
+            log("[REQ]", f"服务器 {time.time() - t0:.1f}s 返回 {r.status_code}")
         r.raise_for_status()
         return r.json().get("text", "") or ""
 
@@ -969,6 +1014,12 @@ class Recorder:
                       "chars": 0, "cancelled": 0, "retried": 0}
         self.store = ResultStore(args.transcripts_dir, enabled=args.log_transcripts)
         self.failed = FailedAudioStore(args.failed_audio_dir, enabled=True)
+        self.debug_audio = bool(getattr(args, "debug_audio", False))
+        self._dbg_frames = 0
+        self._dbg_last = 0.0
+        self._prev_cb = 0.0
+        mic_db = float(getattr(args, "mic_gain_db", 0.0) or 0.0)
+        self._mic_gain = 10 ** (mic_db / 20.0) if mic_db else 1.0
         self.queue = TranscribeQueue(
             workers=args.queue_workers,
             maxsize=args.queue_max,
@@ -1008,13 +1059,23 @@ class Recorder:
         reason = reason or seg.reason
         job = Job(audio=audio, index=seg.index, seconds=audio.size / RATE,
                   reason=reason, peak_db=seg.peak_db)
+        if getattr(self.args, "save_audio", False):
+            d = getattr(self.args, "save_audio_dir", ".build_tmp/recorded")
+            try:
+                os.makedirs(d, exist_ok=True)
+                fname = os.path.join(d, f"seg-{time.strftime('%H%M%S')}-"
+                                        f"#{seg.index}-{job.seconds:.1f}s.wav")
+                sf.write(fname, audio, RATE)
+                log("[SAVE_AUDIO]", fname)
+            except Exception as e:
+                log("[WARN]", f"保存音频失败: {e}")
         pending = self.queue.enqueue(job)
         with self.stats_lock:
             self.stats["segments"] += 1
         log("[SEG]", f"#{seg.index} 切出一段 {job.seconds:.2f}s "
                      f"(峰值 {seg.peak_db:.0f} dBFS, {reason}) → 已排队，"
                      f"待处理 {pending}")
-        beep(900, 60)
+        beep_async(900, 60)
         self._refresh_title()
         if pending >= self.args.backlog_warn:
             log("[WARN]", f"转写积压 {pending} 段：说话可以继续，文本会稍后依次输出")
@@ -1045,7 +1106,7 @@ class Recorder:
             log("[PASTE]", f"#{job.index} 已粘贴到光标处")
         if path:
             log("[SAVE]", f"#{job.index} 已追加到 {path}")
-        beep(1500, 60)
+        beep_async(1500, 60)
         self._refresh_title()
 
     def _on_error(self, job: Job) -> None:
@@ -1060,17 +1121,37 @@ class Recorder:
 
     def _callback(self, indata, frames, time_info, status) -> None:
         """Audio thread. Must stay fast: no I/O, no waiting on inference."""
+        now = time.monotonic()
+        if self.debug_audio:
+            if self._prev_cb and now - self._prev_cb > 0.10:
+                # A gap > 100 ms means the audio stream starved: either this
+                # callback was blocked (a beep used to block here) or the
+                # device/buffer is misbehaving.
+                log("[AUDIO]", f"回调间隔 {(now - self._prev_cb) * 1000:.0f} ms"
+                               f"（>100ms，音频流卡顿）")
+            self._prev_cb = now
         with self.lock:
             if not self.gate or self.seg is None:
                 return
             seg = self.seg
+        block = indata[:, 0]
+        if self._mic_gain != 1.0:
+            block = np.clip(block * self._mic_gain, -1.0, 1.0)
         try:
-            out = seg.feed(indata[:, 0])
+            out = seg.feed(block)
         except Exception as e:                     # never kill the audio stream
             log("[ERR]", f"切段异常: {e}")
             with self.lock:
                 self.gate = False
             return
+        if self.debug_audio:
+            self._dbg_frames += frames
+            if not self._dbg_last or now - self._dbg_last >= 0.5:
+                self._dbg_last = now
+                lvl = dbfs(indata[:, 0])
+                log("[AUDIO]", f"已录 {self._dbg_frames / RATE:5.2f}s 电平 "
+                               f"{lvl:6.1f} dBFS")
+                self._dbg_frames = 0
         if out is not None:
             self.enqueue(out)
 
@@ -1118,7 +1199,7 @@ class Recorder:
                 self.seg = None
                 return
             self.gate = True
-        beep(1200, 120)
+        beep_async(1200, 120)
         if self.args.adaptive_noise:
             local, levels = self.describe_gates()
             log("[REC]", f"录音中…（停顿 {self.args.silence_hold:.2f}s 自动切段；"
@@ -1139,7 +1220,7 @@ class Recorder:
         seconds = seg.cancel()
         with self.stats_lock:
             self.stats["cancelled"] += 1
-        beep(400, 150)
+        beep_async(400, 150)
         log("[CANCEL]", f"已丢弃当前 {seconds:.2f}s（排队中的不受影响）")
         self._refresh_title()
         return True
@@ -1181,7 +1262,7 @@ class Recorder:
             else:
                 floor_note = ""
             tail = seg.flush("manual") if seg is not None else None
-        beep(700, 120)
+        beep_async(700, 120)
         if tail is not None:
             self.enqueue(tail, reason="stop")
         pending = self.queue.pending()
@@ -1290,8 +1371,11 @@ def build_hotkey_handler(trigger: str, mods: list[str], recorder: Recorder,
             state["down"] = False
             try:
                 if not recorder.stop():
+                    log("[HOTKEY]", "开始录音")
                     recorder.start()
                     recorder.arm_watchdog()
+                else:
+                    log("[HOTKEY]", "停止录音")
             except Exception as e:
                 log("[ERR]", f"快捷键处理异常（已复位）: {e}")
                 with recorder.lock:
@@ -1342,6 +1426,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default=str(_cfg("voice_device", default="")) or None,
                    help="input device index or name fragment, e.g. --device 1 or "
                         "--device bose (default: system default input)")
+    p.add_argument("--debug-audio", action="store_true",
+                   help="log the mic level every 0.5s and flag any callback "
+                        "stall during recording (diagnose 'no input' / freezes)")
+    p.add_argument("--save-audio", action="store_true",
+                   help="save every recorded segment as a WAV under "
+                        "--save-audio-dir (diagnose: inspect what the mic "
+                        "actually captured)")
+    p.add_argument("--save-audio-dir", default=str(_cfg("voice_save_audio_dir",
+                                                        default=".build_tmp/recorded")),
+                   help="directory for --save-audio segments (default: "
+                        ".build_tmp/recorded)")
+    p.add_argument("--mic-gain-db", type=float,
+                   default=_cfg("voice_mic_gain_db", default=12.0),
+                   help="apply a fixed pre-amplification (dB) to the mic "
+                        "signal before VAD and transcription. Default +12 dB: "
+                        "on this machine speech captured 40-60 cm away lands "
+                        "around -45..-40 dBFS, which the model hears as filler "
+                        "(嗯。); +12 dB brings it into a transcribable range. "
+                        "Set 0 to disable, or use the Windows mic boost "
+                        "instead (raises SNR too).")
 
     g = p.add_argument_group("silence splitting (VAD)")
     g.add_argument("--vad", action=argparse.BooleanOptionalAction,

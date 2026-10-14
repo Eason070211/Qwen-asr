@@ -96,6 +96,11 @@ class Settings(BaseSettings):
     # target RMS before sending it.
     voice_auto_gain: bool = True
     voice_gain_target_db: float = -22.0
+    # Fixed pre-amplification applied to the mic signal before VAD and
+    # transcription. This machine's array captures normal-distance speech at
+    # -45..-40 dBFS, below what the 0.6B model transcribes reliably (it answers
+    # "嗯。"); +12 dB puts it in range. Raise/lower with --mic-gain-db.
+    voice_mic_gain_db: float = 12.0
     # Language auto-detection returns nothing for Chinese on this model, so an
     # empty result is retried once with this language ("" disables the retry).
     voice_fallback_language: str = "Chinese"
