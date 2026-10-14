@@ -1185,6 +1185,10 @@ class Recorder:
         with self.lock:
             if self.gate:
                 return
+            # Immediate audio feedback BEFORE opening the stream: the first
+            # InputStream open on this machine takes ~1 s, and without this the
+            # click lands a second late (felt as "no beep on the first press").
+            beep_async(1200, 120)
             self._close_stream_locked()
             self.seg = self._new_segmenter()
             self.seg.reset()
@@ -1199,7 +1203,6 @@ class Recorder:
                 self.seg = None
                 return
             self.gate = True
-        beep_async(1200, 120)
         if self.args.adaptive_noise:
             local, levels = self.describe_gates()
             log("[REC]", f"录音中…（停顿 {self.args.silence_hold:.2f}s 自动切段；"
